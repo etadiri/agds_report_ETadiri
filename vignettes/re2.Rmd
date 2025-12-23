@@ -1,0 +1,332 @@
+---
+title: "Report 2: Spatial Upscaling"
+author: "ETadiri"
+date: "2025-12-23"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+library(tidyverse); library(skimr); library(rsample); library(caret);
+library(ggplot2); library(sf); library(rnaturalearth); library(rnaturalearthdata)
+```
+# 1. LOAD DATA
+```{r}
+df <- readr::read_csv("https://raw.githubusercontent.com/geco-bern/leafnp_data/main/data/leafnp_tian_et_al.csv")
+```
+```{r}
+common_species <- df |> 
+  group_by(Species) |> 
+  summarise(count = n()) |> 
+  arrange(desc(count)) |> 
+  slice(1:50) |> 
+  pull(Species)
+
+dfs <- df |> 
+  dplyr::select(leafN, lon, lat, elv, mat, map, ndep, mai, Species) |> 
+  filter(Species %in% common_species)
+  # group_by(lon, lat) |> 
+  # summarise(across(where(is.numeric), mean))
+
+# quick overview of data
+skimr::skim(dfs)
+```
+
+```{r}
+# show missing data
+visdat::vis_miss(dfs)
+```
+
+# 2. LITERATURE
+Ludwig, Marvin, Alvaro Moreno-Martinez, Norbert Hölzel, Edzer Pebesma, and Hanna Meyer. 2023. “Assessing and Improving the Transferability of Current Global Spatial Prediction Models.” Global Ecology and Biogeography 32 (3): 356–68. https://doi.org/10.1111/geb.13635.
+
+### 2.1. REPORT ANSWER
+Q: Explain the difference between a random cross-validation and a spatial cross-validation.
+
+A: Random cross-validation (RCV) randomly splits the data into training and test sets, whereas spatial cross-validation (SCV) splits the data into training and test sets based on spatial arrangement. Therefore, RCV may have limited generalisability to predictions for new spatial areas, and Ploton et al. suggest RCV may not be suitable for spatially-clustered reference data. RCV may test the model's ability to make predictions within the clusters well, but may be limited for making reliable predictions beyond them.
+SCV may better reflect a model’s ability to predict with unseen data when data is spatially autocorrelated. However, in the paper, Wadoux et al. caution that SCV may be overly pessimistic in estimates of map accuracy. 
+
+
+
+### 2.2. REPORT ANSWER
+Q: In spatial upscaling, we model the target based on environmental covariates. This implies that we assume the training data to sufficiently represent the conditions on which the model will be applied for generating predictions. Prediction errors may increase with an increasing distance of the prediction location from the training locations. The paper by Ludwig et al. (2023) considers this “distance” as a geographical distance in Euclidian space. Do you see an alternative to measuring a distance that considers the task of spatial upscaling based on environmental covariates more directly?
+
+A: Rather than thinking of distance solely as geographical distance in Euclidian space, we can use gradients of environmental covariates (for example temperature, precipitation, solar radiation, elevation), and the spatial distribution of the target to inform our upscaling and generate more generalisable models. This is because using environmental gradients rather than geographical distance takes into account how similar the environmental conditions of the predictions are to those that the model was trained on. This could lead to lower prediction errors especially in areas where the distribution of the target variable is very dependent on the environmental conditions. In other words, in predicting a target with SCV, a prediction location could be very far away in geographical distance but have very similar environmental conditions to the training data, and therefore the model would still perform well in predicting, whereas another prediction point could be very close geographically but have vastly different terrain or climatic conditions, so that model will not perform as well to predict this location.
+
+
+# 3. RANDOM CROSS-VALIDATION
+```{r}
+# Random Forest to perform a 5-fold cross-validation with the leaf N data (leafN) 
+
+# Split the data
+set.seed(999)  # Set seed for reproducibility
+split <- rsample::initial_split(dfs, prop = 0.8)
+df_train <- rsample::training(split)
+df_test <- rsample::testing(split)
+
+# Model formulation
+pp <- recipes::recipe(leafN ~ elv + mat + map + ndep + mai + Species, 
+                      data = df_train) |> 
+  recipes::step_center(recipes::all_numeric(), -recipes::all_outcomes()) |>
+  recipes::step_scale(recipes::all_numeric(), -recipes::all_outcomes())
+
+# RF model
+rf <- caret::train(
+  pp, 
+  data = df_train %>% 
+    drop_na(), 
+  method = "ranger",
+  metric = "RMSE",
+  trControl = trainControl(
+    method = "cv",
+    number = 5,
+    savePredictions = "final"
+    ),
+  tuneGrid = expand.grid(
+    .mtry = 3,        
+    .min.node.size = 12,         
+    .splitrule = "variance"      # default is variance
+  ),
+  replace = FALSE,
+  sample.fraction = 0.5,
+  seed = 999
+) # default num.trees is 500
+
+print(rf)
+
+```
+RMSE is 2.393576
+Rsquared is 0.7803947
+
+# 4. SPATIAL CROSS-VALIDATION
+```{r}
+# get coast outline
+coast <- rnaturalearth::ne_coastline(scale = 110, returnclass = "sf")
+
+ggplot() +
+
+  # plot coastline
+  geom_sf(
+    data = coast,
+    colour = "black",
+    size = 0.2
+  ) +
+
+  # set extent in longitude and latitude
+  coord_sf(
+    ylim = c(-60, 80),
+    expand = FALSE
+  ) + # to draw map strictly bounded by the specified extent
+
+  # plot points on map
+  geom_point(data = dfs, aes(x = lon, y = lat), color = "red", size = 0.3) +
+  labs(x = "", y = "") +
+  theme_bw() +
+  theme(legend.position = "bottom")
+```
+
+
+### 4.1. REPORT ANSWER
+Q: What do you observe? Discuss the potential implications of the geographical distribution of data points for spatial upscaling.
+
+A: We can observe that the spatial distribution is very clustered in Europe and East Asia, with few data points in North America, South America, Oceania, and Africa. This clustering could indicate limitations and/or biases in the data collected and may limit the representativeness of outcomes at a global scale. In this case, perhaps spatial cross-validation would yield more realistic results than random cross-validation since the data are highly clustered.
+
+
+### 4.2. REPORT ANSWER 
+ Q: Perform a spatial cross-validation. To do so, first identify geographical clusters of the data using the k-means algorithm (an unsupervised machine learning method), considering the longitude and latitude of data points and setting k=5.
+ 
+ A:
+```{r}
+# Perform a spatial cross-validation. Use the k-means algorithm (an unsupervised machine learning method), considering the longitude and latitude of data points and setting k=5.
+
+dfs$clusters <- as.factor(
+  kmeans(
+    dfs[,2:3], # longitude and latitude
+    centers = 5
+    )
+  $cluster
+  )
+
+  
+# Plot points on a global map, showing the five clusters with distinct colors.
+ggplot() +
+    # plot coastline
+  geom_sf(
+    data = coast,
+    colour = "black",
+    size = 0.2
+  ) +
+
+  # set extent in longitude and latitude
+  coord_sf(
+    ylim = c(-60, 80),
+    expand = FALSE
+  ) + # to draw map strictly bounded by the specified extent
+
+  # plot points on map
+  geom_point(data = dfs, aes(x = lon, y = lat, color = clusters), size = 0.4) +
+  labs(x = "", y = "") +
+  theme_bw() +
+  theme(legend.position = "bottom")
+```
+
+### 4.3. REPORT ANSWER
+ Q: Plot leaf N distribution by cluster
+ 
+ A:
+```{r}
+# Plot the distribution of leaf N by cluster.
+plot_ln <- ggplot(dfs, 
+  aes(x = clusters, y = leafN, fill = clusters)) +
+  geom_boxplot() +
+  theme_bw() +
+  theme(
+    legend.position = "none",
+    plot.title = element_text(size = 10)
+  ) +
+  ggtitle("Leaf N distribution by cluster") +
+  xlab("Cluster") +
+  ylab("Leaf N")
+
+plot_ln
+```
+
+### 4.4. REPORT ANSWER 
+ Q: Split your data into five folds that correspond to the geographical clusters identified by in (2.), and fit a random forest model with the same hyperparameters as above and performing a 5-fold cross-validation with the clusters as folds. Report the RMSE and the Rsquared determined on each of the five folds
+ 
+ A:
+```{r}
+# create folds based on clusters
+group_folds_train <- purrr::map(
+  seq(length(unique(dfs$clusters))),
+  ~ {
+    dfs |>
+      select(clusters) |>
+      mutate(idx = 1:n()) |>
+      filter(clusters != .) |>
+      pull(idx)
+  }
+)
+
+group_folds_test <- purrr::map(
+  seq(length(unique(dfs$clusters))),
+  ~ {
+    dfs |>
+      select(clusters) |>
+      mutate(idx = 1:n()) |>
+      filter(clusters == .) |>
+      pull(idx)
+  }
+)
+
+
+# create a function that trains a random forest model on a given set of rows and
+# predicts on a distinct set of rows
+target <- "leafN"
+predictors <- c("elv", "mat", "map", "ndep", "mai", "Species")
+
+train_test_by_fold <- function(dfs, idx_train, idx_val) {
+  
+  dfs_train <- as.data.frame(dfs[idx_train, c(target, predictors)]) # training
+  dfs_val <- as.data.frame(dfs[idx_val, c(target, predictors)]) # validation
+  
+  mod <- ranger::ranger(
+    x =  dfs_train[,predictors], # data frame with columns corresponding to predictors
+    y =  as.numeric(dfs_train[,target]) # a vector of the target values (not a data frame!)
+  )
+
+  pred <- predict(mod, # the fitted model object
+    data = dfs_val[,predictors] # a data frame with columns corresponding to predictors
+  )$predictions
+
+  rsq <- cor(pred, as.numeric(dfs_val[,target]))^2 # the R-squared determined on the validation set
+  rmse <- sqrt(mean((pred - as.numeric(dfs_val[,target]))^2)) # the root mean square error on the validation set
+
+  return(tibble(rsq = rsq, rmse = rmse))
+}
+
+# apply function on each custom fold and collect validation results in a nice data frame
+out <- purrr::map2_dfr(
+  group_folds_train,
+  group_folds_test,
+  ~ train_test_by_fold(dfs,.x, .y)
+) |>
+  mutate(test_fold = 1:5)
+
+out
+```
+
+### 4.5. REPORT ANSWER 
+Q: Compare the results of the spatial cross-validation to the results of the random cross-validation and discuss reasons for why you observe a difference in the cross-validation metrics (if you do).
+
+A: 
+The random cross-validation gives performance metrics across the entire dataset (RMSE of 2.393576
+and Rsquared of 0.7803947), meaning the difference between predicted and observed values of leaf N is on average approximately 2.39, and the model explains about 78.0% of the variance in the observed data. 
+
+On the other hand, the spatial cross-validation gives performance metrics per cluster-based fold, with RMSE ranging from 2.61 to 11.28 (mean approximately 5.66), and Rsquared ranging from 0.00 to 0.57 (mean approximately 0.33), confirming that the performance varies spatially. 
+
+On average, the spatial cross-validation performs much worse than the random cross-validation, with higher RMSE and lower Rsquared, and much variation between the folds. This worse performance is likely partially due to the fold size distribution. For example, fold 4 has the fewest training data points, and also the highest RMSE and lowest Rsquared, indicating weak predictive performance. In short, fewer data points int he training data lead to worse performance in that fold. 
+Additionally, since the clusters are based one spatial proximity, and there is likely spatial autocorrelation, where points near each other tend to be more similar, so when an entire geographic region is held out, the model predictions become less reliable since it cannot predict entirely new areas well.
+
+
+# 5. ENVIRONMENTAL CROSS-VALIDATION
+### 5.1. REPORT ANSWER
+Q: Perform a custom cross-validation as above, but this time considering five clusters of points not in geographical space, but in environmental space - spanned by the mean annual precipitation (map) and the mean annual temperature (mat). Report the R-squared and the RMSE on the validation set of each of the five folds.
+
+A:
+```{r}
+# Cluster by environmental space - map and mat
+dfs$clusters_ecv <- as.factor(
+  kmeans(
+    dfs[,5:6], # map and map
+    centers = 5
+  )
+  $cluster
+)
+
+# create folds based on clusters
+group_folds_train_ecv <- purrr::map(
+  seq(length(unique(dfs$clusters_ecv))),
+  ~ {
+    dfs |>
+      select(clusters_ecv) |>
+      mutate(idx = 1:n()) |>
+      filter(clusters_ecv != .) |>
+      pull(idx)
+  }
+)
+
+group_folds_test_ecv <- purrr::map(
+  seq(length(unique(dfs$clusters_ecv))),
+  ~ {
+    dfs |>
+      select(clusters_ecv) |>
+      mutate(idx = 1:n()) |>
+      filter(clusters_ecv == .) |>
+      pull(idx)
+  }
+)
+
+out_ecv <- purrr::map2_dfr(
+  group_folds_train_ecv,
+  group_folds_test_ecv,
+  ~ train_test_by_fold(dfs,.x, .y)
+) |>
+  mutate(test_fold = 1:5)
+
+out_ecv
+```
+
+### 5.2. REPORT ANSWER 
+Q: Compare the results of the environmental cross-validation to the results of the random and the spatial cross-validation and discuss reasons for why you observe a difference in the cross-validation metrics (if you do).
+
+A: The environmental cross-validation (ECV) gives performance metrics per fold, with each fold representing different environmental conditions. The ECV RMSE ranges from 2.96 to 3.77 (mean approximately 3.31), and Rsquared ranges from 0.48 to 0.66 (mean approximately 0.58). The Rsquared is on average lower than the random cross-validation (RCV), but higher that the spatial cross-validation (SCV), and the RMSE is higher than the RCV and lowe than the SCV, meaning the model performs slightly worse than the RCV, but by far better than the SCV, explaining more of the variation, and with smaller prediction errors. Additionally, the variability between folds was much less in the ECV than the SCV. Together, these suggest that splitting based on consideration of environmental factors like mean annual precipitation and mean annual temperature which play a role in the target outcome leaf N, is better than splitting based on geographical proximity. 
+In addition, while the RCV overall outperforms both the ECV and SCV, since it includes different geographic regions and environmental conditions in each fold, it produces a low RMSE and high Rsquared, though may not perform well in predicting unseen conditions or regions.  
+
+
+
+
+
